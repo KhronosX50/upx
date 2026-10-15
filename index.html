@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111418">
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png">
+<link rel="apple-touch-icon" href="./icons/icon-192.png">
+<title>Video Upscaler</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #111418; color: #e8eaed;
+    padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+  }
+  main { max-width: 520px; margin: 0 auto; padding: 20px 0; }
+  h1 { font-size: 1.4rem; margin: 0 0 16px; }
+  .card { background: #1c2026; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  label { display: block; font-size: 0.9rem; margin: 14px 0 6px; color: #9aa0a6; }
+  input[type=file] { width: 100%; }
+  select {
+    width: 100%; background: #111418; color: #e8eaed;
+    border: 1px solid #333; border-radius: 8px; padding: 10px; font-size: 1rem;
+  }
+  button {
+    width: 100%; padding: 14px; margin-top: 16px; border: 0; border-radius: 10px;
+    background: #4f8cff; color: #fff; font-size: 1rem; font-weight: 600;
+  }
+  button:disabled { background: #333; color: #777; }
+  progress { width: 100%; height: 14px; margin-top: 12px; }
+  .muted { color: #9aa0a6; font-size: 0.85rem; margin: 10px 0 0; }
+  #log {
+    font: 12px ui-monospace, monospace; white-space: pre-wrap;
+    max-height: 160px; overflow: auto; color: #9aa0a6; margin: 0;
+  }
+  a.dl {
+    display: block; text-align: center; padding: 14px; border-radius: 10px;
+    background: #2e7d32; color: #fff; text-decoration: none; font-weight: 600; margin-top: 12px;
+  }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Video Upscaler</h1>
+
+  <div class="card">
+    <label for="file">Video (MP4 or MOV)</label>
+    <input type="file" id="file" accept="video/mp4,video/quicktime,.mp4,.mov">
+
+    <label for="scale">Scale</label>
+    <select id="scale">
+      <option value="2">2x</option>
+      <option value="3">3x</option>
+      <option value="4">4x</option>
+    </select>
+
+    <label for="quality">Quality</label>
+    <select id="quality">
+      <option value="0.06">Smaller file</option>
+      <option value="0.10" selected>Balanced</option>
+      <option value="0.16">Higher quality</option>
+    </select>
+
+    <button id="go" disabled>Upscale</button>
+    <progress id="bar" value="0" max="1" class="hidden"></progress>
+    <p class="muted" id="status">Checking browser...</p>
+  </div>
+
+  <div class="card">
+    <pre id="log"></pre>
+  </div>
+
+  <div id="result"></div>
+</main>
+
+<!-- mp4box: MP4 demuxer, loaded as a classic script (sets the global MP4Box) -->
+<script src="./vendor/mp4box.all.min.js"></script>
+
+<script type="module">
+  import { Muxer, ArrayBufferTarget } from './vendor/mp4-muxer.mjs';
+
+  const $ = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const even = (n) => Math.max(2, Math.floor(n / 2) * 2);
+
+  // Tried in order. Level 5.1 covers 4K, level 4.0 covers 1080p, Main 4.0 is the fallback.
+  const CODEC_CANDIDATES = ['avc1.640033', 'avc1.640028', 'avc1.4d0028'];
+
+  // AAC sampling frequency table (ISO/IEC 14496-3), indexed for AudioSpecificConfig.
+  const AAC_FREQS = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+  function log(msg) {
+    const el = $('log');
+    el.textContent += msg + '\n';
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setStatus(text) { $('status').textContent = text; }
+
+  function setBar(value) {
+    $('bar').value = Math.min(1, Math.max(0, value));
+  }
+
+  function updateButton() {
+    $('go').disabled = !$('file').files.length;
+  }
+
+  function browserSupported() {
+    return typeof VideoDecoder !== 'undefined' &&
+           typeof VideoEncoder !== 'undefined' &&
+           typeof EncodedVideoChunk !== 'undefined' &&
+           typeof EncodedAudioChunk !== 'undefined' &&
+           typeof VideoFrame !== 'undefined' &&
+           typeof OffscreenCanvas !== 'undefined' &&
+           typeof MP4Box !== 'undefined';
+  }
+
+  // Builds the 2-byte AAC-LC AudioSpecificConfig the MP4 container needs.
+  function buildAacConfig(sampleRate, channels) {
+    const idx = AAC_FREQS.indexOf(sampleRate);
+    if (idx < 0) return null;
+    const out = new Uint8Array(2);
+    out[0] = (2 << 3) | (idx >> 1);          // audio object type 2 (AAC-LC) + high bits of frequency index
+    out[1] = ((idx & 1) << 7) | (channels << 3); // low bit of frequency index + channel configuration
+    return out;
+  }
+
+  // Parses the MP4 and returns video samples, optional audio samples, and codec config.
+  function readMp4(buffer) {
+    return new Promise((resolve, reject) => {
+      const mp4 = MP4Box.createFile();
+      const videoSamples = [];
+      const audioSamples = [];
+      let videoTrack = null;
+      let audioTrack = null;
+
+      mp4.onError = (e) => reject(new Error('Could not read this file: ' + e));
+      mp4.onReady = (info) => {
+        videoTrack = info.videoTracks[0] || null;
+        audioTrack = info.audioTracks[0] || null;
+        if (!videoTrack) return reject(new Error('No video track found in this file.'));
+
+        mp4.setExtractionOptions(videoTrack.id, null, { nbSamples: 1000000000 });
+        if (audioTrack) {
+          mp4.setExtractionOptions(audioTrack.id, null, { nbSamples: 1000000000 });
+        }
+        mp4.start();
+      };
+      mp4.onSamples = (id, _user, batch) => {
+        const target = videoTrack && id === videoTrack.id ? videoSamples
+                     : audioTrack && id === audioTrack.id ? audioSamples
+                     : null;
+        if (target) {
+          for (const s of batch) target.push(s);
+        }
+      };
+
+      buffer.fileStart = 0;
+      mp4.appendBuffer(buffer);
+      mp4.flush();
+
+      if (!videoTrack) return reject(new Error('Could not parse this file. Use an MP4 or MOV video.'));
+
+      const trak = mp4.getTrackById(videoTrack.id);
+      const entry = trak.mdia.minf.stbl.stsd.entries[0];
+      const configBox = entry.avcC || entry.hvcC;
+      let description;
+      if (configBox) {
+        const stream = new MP4Box.DataStream();
+        stream.endianness = MP4Box.DataStream.BIG_ENDIAN;
+        configBox.write(stream);
+        description = new Uint8Array(stream.buffer, 8); // skip the box header
+      }
+
+      let audio = null;
+      let audioSkipReason = null;
+      if (audioTrack) {
+        if (audioTrack.codec !== 'mp4a.40.2') {
+          audioSkipReason = `audio codec is ${audioTrack.codec}, only AAC-LC (mp4a.40.2) can be copied`;
+        } else {
+          const sampleRate = audioTrack.audio.sample_rate;
+          const channels = audioTrack.audio.channel_count;
+          const description = buildAacConfig(sampleRate, channels);
+          if (!description) {
+            audioSkipReason = `unsupported audio sample rate ${sampleRate}`;
+          } else {
+            audio = {
+              track: audioTrack,
+              samples: audioSamples,
+              sampleRate,
+              channels,
+              description,
+            };
+          }
+        }
+      }
+
+      resolve({
+        videoTrack,
+        videoSamples,
+        codec: videoTrack.codec,
+        description,
+        audio,
+        audioSkipReason,
+      });
+    });
+  }
+
+  async function upscale(file, scale, bitsPerPixel) {
+    setBar(0);
+    const buffer = await file.arrayBuffer();
+    const parsed = await readMp4(buffer);
+    const { videoTrack: track, videoSamples: samples, codec, description, audio, audioSkipReason } = parsed;
+    if (!samples.length) throw new Error('No frames found in this video.');
+
+    const srcW = track.track_width;
+    const srcH = track.track_height;
+    const outW = even(srcW * scale);
+    const outH = even(srcH * scale);
+
+    let totalTicks = 0;
+    for (const s of samples) totalTicks += s.duration;
+    const seconds = totalTicks / track.timescale;
+    const fps = Math.min(60, Math.max(1, (samples.length / seconds) || 30));
+    const bitrate = Math.min(40000000, Math.round(outW * outH * fps * bitsPerPixel));
+
+    log(`Input ${srcW}x${srcH}, ${samples.length} video frames, ~${fps.toFixed(1)} fps`);
+    log(`Output ${outW}x${outH}, bitrate ${(bitrate / 1e6).toFixed(1)} Mbps`);
+
+    const audioCopied = !!audio;
+    if (audioCopied) {
+      log(`Audio: AAC-LC, ${audio.sampleRate} Hz, ${audio.channels} ch, copied unchanged`);
+    } else if (audioSkipReason) {
+      log(`Audio not copied: ${audioSkipReason}. Output will have no sound.`);
+    } else {
+      log('No audio track in source.');
+    }
+
+    // Pick the first H.264 level this phone's encoder accepts at the output size.
+    let encoderConfig = null;
+    for (const c of CODEC_CANDIDATES) {
+      const cfg = { codec: c, width: outW, height: outH, bitrate, framerate: fps };
+      const res = await VideoEncoder.isConfigSupported(cfg);
+      if (res.supported) { encoderConfig = cfg; break; }
+    }
+    if (!encoderConfig) {
+      throw new Error(`This phone can't encode ${outW}x${outH} H.264. Try a smaller scale.`);
+    }
+
+    const target = new ArrayBufferTarget();
+    const muxerOptions = {
+      target,
+      video: { codec: 'avc', width: outW, height: outH, frameRate: fps },
+      fastStart: 'in-memory',
+    };
+    if (audioCopied) {
+      muxerOptions.audio = { codec: 'aac', numberOfChannels: audio.channels, sampleRate: audio.sampleRate };
+    }
+    const muxer = new Muxer(muxerOptions);
+
+    // Audio is passed through as-is: the encoded AAC packets are written without decoding.
+    if (audioCopied) {
+      audio.samples.forEach((s, i) => {
+        const chunk = new EncodedAudioChunk({
+          type: 'key',
+          timestamp: Math.round((1e6 * s.cts) / audio.track.timescale),
+          duration: Math.round((1e6 * s.duration) / audio.track.timescale),
+          data: s.data,
+        });
+        if (i === 0) {
+          muxer.addAudioChunk(chunk, {
+            decoderConfig: {
+              codec: 'mp4a.40.2',
+              numberOfChannels: audio.channels,
+              sampleRate: audio.sampleRate,
+              description: audio.description,
+            },
+          });
+        } else {
+          muxer.addAudioChunk(chunk);
+        }
+      });
+    }
+
+    let encodeError = null;
+    let decodeError = null;
+
+    const encoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => { encodeError = e; },
+    });
+    encoder.configure(encoderConfig);
+
+    const canvas = new OffscreenCanvas(outW, outH);
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    let outIndex = 0;
+
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        ctx.drawImage(frame, 0, 0, outW, outH);
+        const scaled = new VideoFrame(canvas, {
+          timestamp: frame.timestamp,
+          duration: frame.duration ?? undefined,
+        });
+        encoder.encode(scaled, { keyFrame: outIndex % 120 === 0 });
+        scaled.close();
+        frame.close();
+        outIndex++;
+      },
+      error: (e) => { decodeError = e; },
+    });
+    decoder.configure({ codec, codedWidth: srcW, codedHeight: srcH, description });
+
+    try {
+      for (let i = 0; i < samples.length; i++) {
+        if (decodeError) throw decodeError;
+        if (encodeError) throw encodeError;
+
+        // Don't outrun the hardware: wait while either queue is backed up.
+        while (decoder.decodeQueueSize > 8 || encoder.encodeQueueSize > 8) {
+          await sleep(5);
+        }
+
+        const s = samples[i];
+        decoder.decode(new EncodedVideoChunk({
+          type: s.is_sync ? 'key' : 'delta',
+          timestamp: Math.round((1e6 * s.cts) / track.timescale),
+          duration: Math.round((1e6 * s.duration) / track.timescale),
+          data: s.data,
+        }));
+
+        setBar((i / samples.length) * 0.95);
+      }
+
+      await decoder.flush();
+      await encoder.flush();
+      if (decodeError) throw decodeError;
+      if (encodeError) throw encodeError;
+      muxer.finalize();
+    } finally {
+      if (decoder.state !== 'closed') decoder.close();
+      if (encoder.state !== 'closed') encoder.close();
+    }
+
+    setBar(1);
+    log(`Encoded ${outIndex} frames`);
+    return { blob: new Blob([target.buffer], { type: 'video/mp4' }), audioCopied };
+  }
+
+  $('file').addEventListener('change', () => {
+    $('result').textContent = '';
+    updateButton();
+  });
+
+  $('go').addEventListener('click', async () => {
+    const file = $('file').files[0];
+    if (!file) return;
+
+    const scale = Number($('scale').value);
+    const bpp = Number($('quality').value);
+    const base = file.name.replace(/\.[^.]+$/, '');
+
+    $('go').disabled = true;
+    $('bar').classList.remove('hidden');
+    $('log').textContent = '';
+    $('result').textContent = '';
+    setStatus('Processing. Keep this screen open. Long clips take a while.');
+
+    try {
+      const { blob, audioCopied } = await upscale(file, scale, bpp);
+      const link = document.createElement('a');
+      link.className = 'dl';
+      link.href = URL.createObjectURL(blob);
+      link.download = `${base}_${scale}x.mp4`;
+      link.textContent = `Save ${base}_${scale}x.mp4`;
+      $('result').appendChild(link);
+      setStatus(audioCopied
+        ? 'Done. Audio copied unchanged.'
+        : 'Done. No audio in output (see log).');
+    } catch (err) {
+      setStatus('Failed. See the log below.');
+      log(err && err.message ? err.message : String(err));
+    } finally {
+      $('bar').classList.add('hidden');
+      updateButton();
+    }
+  });
+
+  if (browserSupported()) {
+    setStatus('Ready. Pick an MP4 or MOV video.');
+  } else {
+    setStatus('Missing engine files or unsupported browser. Use Chrome on Android 94 or newer, and check that setup.sh ran.');
+  }
+  updateButton();
+</script>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw.js');
+  }
+</script>
+</body>
+</html>
